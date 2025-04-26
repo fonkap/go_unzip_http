@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
@@ -8,7 +9,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 )
 
 const headerLen = 65536
@@ -35,14 +39,42 @@ type CDirentry struct {
 	FileName               string
 }
 
+func getRangeCurl(url string, start int64, n int64) (int, io.ReadCloser, error) {
+	rangeHeader := fmt.Sprintf("Range: bytes=%d-%d", start, start+n-1)
+	cmd := exec.Command("curl", "-v", "-H", rangeHeader, url)
+
+	stderr, _ := cmd.StderrPipe()
+	stdout, _ := cmd.StdoutPipe()
+
+	if err := cmd.Start(); err != nil {
+		return 0, nil, err
+	}
+
+	scanner := bufio.NewScanner(stderr)
+	re := regexp.MustCompile(`HTTP/\d\.\d (\d{3})`)
+	statusCode := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		matches := re.FindStringSubmatch(line)
+		if len(matches) > 1 {
+			statusCode, _ = strconv.Atoi(matches[1])
+			break
+		}
+	}
+
+	return statusCode, stdout, nil
+}
+
 func getRange(url string, start int64, n int64) (io.ReadCloser, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error al crear la petición: %w", err)
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, start+n-1))
+	rangeStr := fmt.Sprintf("bytes=%d-%d", start, start+n-1)
+	req.Header.Set("Range", rangeStr)
 	req.Header.Set("User-Agent", "curl/7.87.0")
 	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Content-Type", "")
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -57,7 +89,7 @@ func getRange(url string, start int64, n int64) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
-func fetchHeader(url string) ([]byte, uint64) {
+func fetchHeader(url string) ([]byte, uint64, error) {
 	resp, _ := http.Head(url)
 	r := resp.Header.Get("Accept-Ranges")
 	if r != "bytes" {
@@ -66,15 +98,17 @@ func fetchHeader(url string) ([]byte, uint64) {
 	zipSize := resp.ContentLength
 	start := max(zipSize-headerLen, 0)
 
-	body, _ := getRange(url, start, headerLen)
+	status, body, err := getRangeCurl(url, start, headerLen)
 
-	//archivo, err := os.Create("data.dat")
-	//_, err = io.Copy(archivo, body)
-	//archivo.Close()
+	if status != http.StatusPartialContent {
+		err = fmt.Errorf("error: código de estado HTTP %d, se esperaba %d", status, http.StatusPartialContent)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
 
 	data, _ := io.ReadAll(body)
-
-	return data, uint64(zipSize)
+	return data, uint64(zipSize), nil
 }
 
 func infoIter(data []byte, zipSize uint64) ([]CDirentry, error) {
@@ -308,21 +342,37 @@ func main() {
 		toExtract = ""
 	}
 
-	data, fileLen := fetchHeader(url)
+	data, fileLen, err := fetchHeader(url)
+	if err != nil {
+		println(err.Error())
+		return
+	}
+
 	entries, _ := infoIter(data, fileLen)
 
 	for _, entry := range entries {
 		fmt.Printf("%s %d %d %x \n", entry.FileName, entry.UncompressedSize, entry.CompressedSize, entry.OffsetLocalHeader)
 
 		if entry.FileName == toExtract {
-			println("Extracting: " + toExtract)
+			fmt.Printf("Extracting: " + toExtract + "\n")
 			sizeof_localhdr := int64(30)
 			headLen := sizeof_localhdr + int64(entry.FileNameLength) + int64(entry.ExtraFieldLength)
 
-			body, _ := getRange(url, int64(entry.OffsetLocalHeader)+headLen, int64(entry.CompressedSize))
-			data, _ := io.ReadAll(body)
+			status, body, err1 := getRangeCurl(url, int64(entry.OffsetLocalHeader)+headLen, int64(entry.CompressedSize))
 
-			//data, _ = readRange(zipFile, int64(entry.OffsetLocalHeader)+headLen, int64(entry.CompressedSize))
+			if status != http.StatusPartialContent {
+				err1 = fmt.Errorf("error: código de estado HTTP %d, se esperaba %d", status, http.StatusPartialContent)
+			}
+			if err1 != nil {
+				print(err1.Error())
+				return
+			}
+
+			data, err2 := io.ReadAll(body)
+			if err2 != nil {
+				print(err2.Error())
+				return
+			}
 
 			var decompressedData []byte
 			var err error
@@ -345,7 +395,7 @@ func main() {
 			archivo, _ := os.Create(entry.FileName)
 			archivo.Write(decompressedData)
 			archivo.Close()
-			println("done")
+			fmt.Printf("done\n")
 		}
 	}
 	return
