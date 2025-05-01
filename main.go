@@ -342,24 +342,36 @@ func main() {
 		toExtract = ""
 	}
 
-	data, fileLen, err := fetchHeader(url)
+	//data, fileLen, err := fetchHeader(url)
+	//os.WriteFile("jsa.data", data, 0644)
+	data, err := os.ReadFile("jsa.data")
+	fileLen := uint64(2994802022)
 	if err != nil {
 		println(err.Error())
 		return
+	} else {
+		fmt.Printf("fileLen: %d\n", fileLen)
 	}
 
 	entries, _ := infoIter(data, fileLen)
 
-	for _, entry := range entries {
+	for i, entry := range entries {
 		fmt.Printf("%s %d %d %x \n", entry.FileName, entry.UncompressedSize, entry.CompressedSize, entry.OffsetLocalHeader)
 
 		if entry.FileName == toExtract {
-			fmt.Printf("Extracting: " + toExtract + "\n")
 			sizeof_localhdr := int64(30)
-			headLen := sizeof_localhdr + int64(entry.FileNameLength) + int64(entry.ExtraFieldLength)
 
-			status, body, err1 := getRangeCurl(url, int64(entry.OffsetLocalHeader)+headLen, int64(entry.CompressedSize))
+			var nextPos uint64
+			if len(entries) > i+1 {
+				nextPos = entries[i+1].OffsetLocalHeader
+			} else {
+				nextPos = fileLen
+			}
 
+			fmt.Printf("Extracting: %s %d %d\n", toExtract, int64(entry.OffsetLocalHeader), nextPos)
+
+			body, err1 := getRange(url, int64(entry.OffsetLocalHeader), int64(nextPos))
+			status := 206
 			if status != http.StatusPartialContent {
 				err1 = fmt.Errorf("error: código de estado HTTP %d, se esperaba %d", status, http.StatusPartialContent)
 			}
@@ -367,8 +379,15 @@ func main() {
 				print(err1.Error())
 				return
 			}
+			_, err = io.CopyN(io.Discard, body, sizeof_localhdr-2)
+			var extraLen uint16
+			binary.Read(body, binary.LittleEndian, &extraLen)
+			_, err = io.CopyN(io.Discard, body, int64(entry.FileNameLength)+int64(extraLen))
 
-			data, err2 := io.ReadAll(body)
+			data = make([]byte, entry.CompressedSize)
+			bytesRead, err2 := io.ReadAtLeast(body, data, int(entry.CompressedSize))
+			fmt.Printf("bytesRead: %d \n", bytesRead)
+			//data, err2 := io.ReadAll(body)
 			if err2 != nil {
 				print(err2.Error())
 				return
