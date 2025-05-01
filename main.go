@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"time"
+	"unzip_http/util"
 )
 
 const headerLen = 65536
@@ -89,26 +91,49 @@ func getRange(url string, start int64, n int64) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
-func fetchHeader(url string) ([]byte, uint64, error) {
-	resp, _ := http.Head(url)
+func fetchHeader(cacheEntry util.CacheEntry) (*util.CacheEntry, error) {
+	req, err := http.NewRequest("HEAD", cacheEntry.URI, nil)
+	// Set If-None-Match header with ETag
+	req.Header.Set("If-None-Match", cacheEntry.ETag)
+
+	// Execute the request
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Println("Error making request:", err)
+		return nil, fmt.Errorf("Error making request:", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotModified {
+		return &cacheEntry, nil
+	}
 	r := resp.Header.Get("Accept-Ranges")
 	if r != "bytes" {
-		fmt.Printf("Accept-Ranges header ('%s') is not 'bytes'--trying anyway", r)
+		return nil, fmt.Errorf("Accept-Ranges header ('%s') is not 'bytes'", r)
 	}
 	zipSize := resp.ContentLength
 	start := max(zipSize-headerLen, 0)
 
-	status, body, err := getRangeCurl(url, start, headerLen)
+	status, body, err := getRangeCurl(cacheEntry.URI, start, headerLen)
 
 	if status != http.StatusPartialContent {
 		err = fmt.Errorf("error: código de estado HTTP %d, se esperaba %d", status, http.StatusPartialContent)
 	}
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	data, _ := io.ReadAll(body)
-	return data, uint64(zipSize), nil
+
+	entry := util.CacheEntry{
+		URI:      cacheEntry.URI,
+		ETag:     resp.Header.Get("ETag"),
+		FileLen:  int(zipSize),
+		LastUsed: time.Now(),
+		Content:  data,
+	}
+
+	return &entry, nil
 }
 
 func infoIter(data []byte, zipSize uint64) ([]CDirentry, error) {
@@ -342,10 +367,32 @@ func main() {
 		toExtract = ""
 	}
 
-	//data, fileLen, err := fetchHeader(url)
-	//os.WriteFile("jsa.data", data, 0644)
-	data, err := os.ReadFile("jsa.data")
-	fileLen := uint64(2994802022)
+	db, err := util.InitDB("cache.db")
+	if err != nil {
+		fmt.Println("Error al inicializar la base de datos:", err)
+		return
+	}
+	defer db.Close()
+
+	cacheEntry, err := util.LoadFromCache(db, url)
+	if cacheEntry == nil {
+		cacheEntry = &util.CacheEntry{
+			URI:      url,
+			ETag:     "",
+			FileLen:  0,
+			LastUsed: time.Now(),
+			Content:  nil,
+		}
+	}
+	newCacheEntry, err := fetchHeader(*cacheEntry)
+	if newCacheEntry.ETag != cacheEntry.ETag {
+		fmt.Printf("caching ETag %s\n", newCacheEntry.ETag)
+		util.SaveToCache(db, *newCacheEntry)
+	} else {
+		fmt.Printf("using data from cache %s\n", newCacheEntry.ETag)
+	}
+
+	fileLen := uint64(newCacheEntry.FileLen)
 	if err != nil {
 		println(err.Error())
 		return
@@ -353,7 +400,7 @@ func main() {
 		fmt.Printf("fileLen: %d\n", fileLen)
 	}
 
-	entries, _ := infoIter(data, fileLen)
+	entries, _ := infoIter(newCacheEntry.Content, fileLen)
 
 	for i, entry := range entries {
 		fmt.Printf("%s %d %d %x \n", entry.FileName, entry.UncompressedSize, entry.CompressedSize, entry.OffsetLocalHeader)
@@ -384,7 +431,7 @@ func main() {
 			binary.Read(body, binary.LittleEndian, &extraLen)
 			_, err = io.CopyN(io.Discard, body, int64(entry.FileNameLength)+int64(extraLen))
 
-			data = make([]byte, entry.CompressedSize)
+			data := make([]byte, entry.CompressedSize)
 			bytesRead, err2 := io.ReadAtLeast(body, data, int(entry.CompressedSize))
 			fmt.Printf("bytesRead: %d \n", bytesRead)
 			//data, err2 := io.ReadAll(body)
